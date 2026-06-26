@@ -94,6 +94,7 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+    show_etd: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +136,7 @@ const IDM_PACE_STYLE_OFF: u16 = 71;
 const IDM_PACE_STYLE_TICK: u16 = 72;
 const IDM_PACE_STYLE_SOLID: u16 = 73;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
+const IDM_SHOW_ETD: u16 = 74;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_DETAILED_REMAINING: u16 = 70;
@@ -322,6 +324,8 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default)]
+    show_etd: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default)]
@@ -345,6 +349,7 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
+            show_etd: false,
             show_claude_code: true,
             show_pace_indicator: false,
             pace_indicator_solid: default_pace_indicator_solid(),
@@ -413,6 +418,7 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            show_etd: s.show_etd,
             show_claude_code: s.show_claude_code,
             show_pace_indicator: s.show_pace_indicator,
             pace_indicator_solid: s.pace_indicator_solid,
@@ -721,6 +727,18 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(claude_code) = data.claude_code.as_ref() {
         state.session_text = poller::format_line(&claude_code.session, strings);
         state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        if state.show_etd {
+            if let Some(s) =
+                poller::etd_suffix(&claude_code.session, poller::SESSION_WINDOW_SECS, strings)
+            {
+                state.session_text.push_str(&s);
+            }
+            if let Some(s) =
+                poller::etd_suffix(&claude_code.weekly, poller::WEEKLY_WINDOW_SECS, strings)
+            {
+                state.weekly_text.push_str(&s);
+            }
+        }
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
@@ -729,6 +747,18 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(codex) = data.codex.as_ref() {
         state.codex_session_text = poller::format_line(&codex.session, strings);
         state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        if state.show_etd {
+            if let Some(s) =
+                poller::etd_suffix(&codex.session, poller::SESSION_WINDOW_SECS, strings)
+            {
+                state.codex_session_text.push_str(&s);
+            }
+            if let Some(s) =
+                poller::etd_suffix(&codex.weekly, poller::WEEKLY_WINDOW_SECS, strings)
+            {
+                state.codex_weekly_text.push_str(&s);
+            }
+        }
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
@@ -742,6 +772,18 @@ fn refresh_usage_texts(state: &mut AppState) {
             } else {
                 poller::format_line(&antigravity.weekly, strings)
             };
+        if state.show_etd {
+            if let Some(s) =
+                poller::etd_suffix(&antigravity.session, poller::SESSION_WINDOW_SECS, strings)
+            {
+                state.antigravity_session_text.push_str(&s);
+            }
+            if let Some(s) =
+                poller::etd_suffix(&antigravity.weekly, poller::WEEKLY_WINDOW_SECS, strings)
+            {
+                state.antigravity_weekly_text.push_str(&s);
+            }
+        }
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
@@ -1280,6 +1322,13 @@ fn total_widget_width() -> i32 {
     total_widget_width_for(active_models)
 }
 
+/// Whether the ETD suffix is enabled, read from shared state. Returns false
+/// when state is not yet populated (startup) or the lock cannot be acquired.
+/// Callers must not hold the state lock.
+fn show_etd_enabled() -> bool {
+    lock_state().as_ref().map_or(false, |s| s.show_etd)
+}
+
 fn claude_accent_color() -> Color {
     Color::from_hex("#D97757")
 }
@@ -1485,6 +1534,7 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                show_etd: settings.show_etd,
             });
         }
 
@@ -2870,6 +2920,18 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_SHOW_ETD => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.show_etd = !s.show_etd;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
                 | IDM_LANG_DUTCH
@@ -3219,6 +3281,19 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             language_menu.0 as usize,
             PCWSTR::from_raw(language_label.as_ptr()),
+        );
+
+        let etd_str = native_interop::wide_str(strings.show_etd);
+        let etd_flags = if show_etd_enabled() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            etd_flags,
+            IDM_SHOW_ETD as usize,
+            PCWSTR::from_raw(etd_str.as_ptr()),
         );
 
         let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
