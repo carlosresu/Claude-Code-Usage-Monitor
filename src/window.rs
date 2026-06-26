@@ -68,6 +68,8 @@ struct AppState {
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
     show_claude_code: bool,
+    show_pace_indicator: bool,
+    pace_indicator_solid: bool,
     show_codex: bool,
     show_antigravity: bool,
     show_detailed_remaining: bool,
@@ -129,10 +131,18 @@ const IDM_LANG_KOREAN: u16 = 47;
 const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
+const IDM_PACE_STYLE_OFF: u16 = 71;
+const IDM_PACE_STYLE_TICK: u16 = 72;
+const IDM_PACE_STYLE_SOLID: u16 = 73;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_DETAILED_REMAINING: u16 = 70;
+
+// 5 hours and 7 days, in seconds. Used to compute "where pace says you
+// should be" by comparing remaining time against the full window length.
+const SESSION_WINDOW_SECS: u64 = 5 * 3600;
+const WEEKLY_WINDOW_SECS: u64 = 7 * 86400;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -314,6 +324,10 @@ struct SettingsFile {
     widget_visible: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
+    #[serde(default)]
+    show_pace_indicator: bool,
+    #[serde(default = "default_pace_indicator_solid")]
+    pace_indicator_solid: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
@@ -332,6 +346,8 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
+            show_pace_indicator: false,
+            pace_indicator_solid: default_pace_indicator_solid(),
             show_codex: false,
             show_antigravity: false,
             show_detailed_remaining: false,
@@ -357,6 +373,10 @@ fn default_show_codex() -> bool {
 
 fn default_show_antigravity() -> bool {
     false
+}
+
+fn default_pace_indicator_solid() -> bool {
+    true
 }
 
 fn load_settings() -> SettingsFile {
@@ -394,11 +414,59 @@ fn save_state_settings() {
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
+            show_pace_indicator: s.show_pace_indicator,
+            pace_indicator_solid: s.pace_indicator_solid,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
             show_detailed_remaining: s.show_detailed_remaining,
         });
     }
+}
+
+/// Where pace says you should be, as a 0-100 percentage of the window
+/// consumed by now. `None` if there is no reset timestamp yet, if the
+/// window has already reset (data is stale), or if the remaining time
+/// exceeds the window length (unexpected, but guarded against).
+fn expected_pace_pct(resets_at: Option<SystemTime>, window_secs: u64) -> Option<f64> {
+    let reset = resets_at?;
+    let remaining = reset.duration_since(SystemTime::now()).ok()?;
+    let remaining_secs = remaining.as_secs();
+    if remaining_secs > window_secs {
+        return None;
+    }
+    let elapsed = window_secs - remaining_secs;
+    Some(elapsed as f64 / window_secs as f64 * 100.0)
+}
+
+/// Pace values for the six usage cells, in the order
+/// (claude session, claude weekly, codex session, codex weekly,
+///  antigravity session, antigravity weekly).
+/// Returns all `None` when the indicator is disabled, when there is no
+/// usage data yet, or when individual reset timestamps are missing.
+fn pace_values_from_state(
+    s: &AppState,
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+) {
+    if !s.show_pace_indicator {
+        return (None, None, None, None, None, None);
+    }
+    let claude = s.data.as_ref().and_then(|d| d.claude_code.as_ref());
+    let codex = s.data.as_ref().and_then(|d| d.codex.as_ref());
+    let antigravity = s.data.as_ref().and_then(|d| d.antigravity.as_ref());
+    (
+        claude.and_then(|c| expected_pace_pct(c.session.resets_at, SESSION_WINDOW_SECS)),
+        claude.and_then(|c| expected_pace_pct(c.weekly.resets_at, WEEKLY_WINDOW_SECS)),
+        codex.and_then(|c| expected_pace_pct(c.session.resets_at, SESSION_WINDOW_SECS)),
+        codex.and_then(|c| expected_pace_pct(c.weekly.resets_at, WEEKLY_WINDOW_SECS)),
+        antigravity.and_then(|c| expected_pace_pct(c.session.resets_at, SESSION_WINDOW_SECS)),
+        antigravity.and_then(|c| expected_pace_pct(c.weekly.resets_at, WEEKLY_WINDOW_SECS)),
+    )
 }
 
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
@@ -1395,6 +1463,8 @@ pub fn run() {
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
                 show_claude_code: settings.show_claude_code,
+                show_pace_indicator: settings.show_pace_indicator,
+                pace_indicator_solid: settings.pace_indicator_solid,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
                 show_detailed_remaining: settings.show_detailed_remaining,
@@ -1527,30 +1597,54 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        session_pace_pct,
+        weekly_pace_pct,
+        codex_session_pace_pct,
+        codex_weekly_pace_pct,
+        antigravity_session_pace_pct,
+        antigravity_weekly_pace_pct,
+        pace_solid,
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-            ),
+            Some(s) => {
+                let (
+                    session_pace,
+                    weekly_pace,
+                    codex_session_pace,
+                    codex_weekly_pace,
+                    antigravity_session_pace,
+                    antigravity_weekly_pace,
+                ) = pace_values_from_state(s);
+                (
+                    s.hwnd,
+                    s.is_dark,
+                    s.embedded,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.antigravity_session_percent,
+                    s.antigravity_session_text.clone(),
+                    s.antigravity_weekly_percent,
+                    s.antigravity_weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    session_pace,
+                    weekly_pace,
+                    codex_session_pace,
+                    codex_weekly_pace,
+                    antigravity_session_pace,
+                    antigravity_weekly_pace,
+                    s.pace_indicator_solid,
+                )
+            }
             None => return,
         }
     };
@@ -1647,6 +1741,13 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            session_pace_pct,
+            weekly_pace_pct,
+            codex_session_pace_pct,
+            codex_weekly_pace_pct,
+            antigravity_session_pace_pct,
+            antigravity_weekly_pace_pct,
+            pace_solid,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1723,6 +1824,13 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    session_pace_pct: Option<f64>,
+    weekly_pace_pct: Option<f64>,
+    codex_session_pace_pct: Option<f64>,
+    codex_weekly_pace_pct: Option<f64>,
+    antigravity_session_pace_pct: Option<f64>,
+    antigravity_weekly_pace_pct: Option<f64>,
+    pace_solid: bool,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1819,6 +1927,10 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            session_pace_pct,
+            codex_session_pace_pct,
+            antigravity_session_pace_pct,
+            pace_solid,
         );
         draw_row(
             hdc,
@@ -1840,6 +1952,10 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            weekly_pace_pct,
+            codex_weekly_pace_pct,
+            antigravity_weekly_pace_pct,
+            pace_solid,
         );
 
         SelectObject(hdc, old_font);
@@ -2668,6 +2784,21 @@ unsafe extern "system" fn wnd_proc(
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
+                IDM_PACE_STYLE_OFF | IDM_PACE_STYLE_TICK | IDM_PACE_STYLE_SOLID => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if id == IDM_PACE_STYLE_OFF {
+                                s.show_pace_indicator = false;
+                            } else {
+                                s.show_pace_indicator = true;
+                                s.pace_indicator_solid = id == IDM_PACE_STYLE_SOLID;
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
@@ -2821,6 +2952,8 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_pace_indicator,
+            pace_indicator_solid,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2835,6 +2968,8 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_pace_indicator,
+                    s.pace_indicator_solid,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2847,6 +2982,8 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    false,
+                    true,
                 ),
             }
         };
@@ -2955,6 +3092,63 @@ fn show_context_menu(hwnd: HWND) {
             startup_flags,
             IDM_START_WITH_WINDOWS as usize,
             PCWSTR::from_raw(startup_str.as_ptr()),
+        );
+
+        // "Show pace indicator" is a submenu whose Off/Tick/Solid items form a
+        // radio group. The parent entry shows a check while a style is active;
+        // selecting Off clears that check and turns the indicator off.
+        let pace_menu = CreatePopupMenu().unwrap();
+
+        let pace_off_str = native_interop::wide_str(strings.pace_style_off);
+        let pace_off_flags = if show_pace_indicator {
+            MENU_ITEM_FLAGS(0)
+        } else {
+            MF_CHECKED
+        };
+        let _ = AppendMenuW(
+            pace_menu,
+            pace_off_flags,
+            IDM_PACE_STYLE_OFF as usize,
+            PCWSTR::from_raw(pace_off_str.as_ptr()),
+        );
+
+        let pace_tick_str = native_interop::wide_str(strings.pace_style_tick);
+        let pace_tick_flags = if show_pace_indicator && !pace_indicator_solid {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            pace_menu,
+            pace_tick_flags,
+            IDM_PACE_STYLE_TICK as usize,
+            PCWSTR::from_raw(pace_tick_str.as_ptr()),
+        );
+
+        let pace_solid_str = native_interop::wide_str(strings.pace_style_solid);
+        let pace_solid_flags = if show_pace_indicator && pace_indicator_solid {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            pace_menu,
+            pace_solid_flags,
+            IDM_PACE_STYLE_SOLID as usize,
+            PCWSTR::from_raw(pace_solid_str.as_ptr()),
+        );
+
+        let pace_label = native_interop::wide_str(strings.show_pace_indicator);
+        let pace_parent_flags = if show_pace_indicator {
+            MF_POPUP | MF_CHECKED
+        } else {
+            MF_POPUP
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            pace_parent_flags,
+            pace_menu.0 as usize,
+            PCWSTR::from_raw(pace_label.as_ptr()),
         );
 
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
@@ -3106,28 +3300,52 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        session_pace_pct,
+        weekly_pace_pct,
+        codex_session_pace_pct,
+        codex_weekly_pace_pct,
+        antigravity_session_pace_pct,
+        antigravity_weekly_pace_pct,
+        pace_solid,
     ) = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                s.language.strings(),
-                s.session_percent,
-                s.session_text.clone(),
-                s.weekly_percent,
-                s.weekly_text.clone(),
-                s.codex_session_percent,
-                s.codex_session_text.clone(),
-                s.codex_weekly_percent,
-                s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-            ),
+            Some(s) => {
+                let (
+                    session_pace,
+                    weekly_pace,
+                    codex_session_pace,
+                    codex_weekly_pace,
+                    antigravity_session_pace,
+                    antigravity_weekly_pace,
+                ) = pace_values_from_state(s);
+                (
+                    s.is_dark,
+                    s.language.strings(),
+                    s.session_percent,
+                    s.session_text.clone(),
+                    s.weekly_percent,
+                    s.weekly_text.clone(),
+                    s.codex_session_percent,
+                    s.codex_session_text.clone(),
+                    s.codex_weekly_percent,
+                    s.codex_weekly_text.clone(),
+                    s.antigravity_session_percent,
+                    s.antigravity_session_text.clone(),
+                    s.antigravity_weekly_percent,
+                    s.antigravity_weekly_text.clone(),
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    session_pace,
+                    weekly_pace,
+                    codex_session_pace,
+                    codex_weekly_pace,
+                    antigravity_session_pace,
+                    antigravity_weekly_pace,
+                    s.pace_indicator_solid,
+                )
+            }
             None => return,
         }
     };
@@ -3192,6 +3410,13 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            session_pace_pct,
+            weekly_pace_pct,
+            codex_session_pace_pct,
+            codex_weekly_pace_pct,
+            antigravity_session_pace_pct,
+            antigravity_weekly_pace_pct,
+            pace_solid,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3222,6 +3447,10 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    claude_pace_pct: Option<f64>,
+    codex_pace_pct: Option<f64>,
+    antigravity_pace_pct: Option<f64>,
+    pace_solid: bool,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -3271,6 +3500,9 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                claude_pace_pct,
+                is_dark,
+                pace_solid,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3285,6 +3517,9 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                codex_pace_pct,
+                is_dark,
+                pace_solid,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -3299,6 +3534,9 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                antigravity_pace_pct,
+                is_dark,
+                pace_solid,
             );
         }
     }
@@ -3320,6 +3558,9 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    pace_pct: Option<f64>,
+    is_dark: bool,
+    pace_solid: bool,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -3372,6 +3613,96 @@ fn draw_usage_bar(
                     let _ = SelectClipRgn(hdc, HRGN::default());
                     let _ = DeleteObject(rgn);
                 }
+            }
+        }
+
+        // Pace indicator. Two styles, selected by pace_solid:
+        //   solid — a filled band spanning the gap between actual usage and
+        //           where pace says the user should be (red overage over the
+        //           orange accent, green headroom over the grey track).
+        //   tick  — a thick vertical bar at the expected-pace position.
+        // Green means usage is behind pace — headroom to ramp up. Red means
+        // usage is ahead of pace — on a trajectory to exhaust the quota early.
+        if let Some(pace) = pace_pct {
+            let expected = pace.clamp(0.0, 100.0);
+            let actual = percent_clamped;
+            let _ = is_dark;
+            let pace_color = if expected < actual {
+                Color::from_hex("#E53935") // red — ahead of pace, may exhaust quota early
+            } else {
+                Color::from_hex("#43A047") // green — behind pace, headroom to ramp up
+            };
+
+            if pace_solid {
+                if (actual - expected).abs() > 0.01 {
+                    let (band_lo, band_hi) = if actual > expected {
+                        (expected, actual)
+                    } else {
+                        (actual, expected)
+                    };
+                    let band_brush = CreateSolidBrush(COLORREF(pace_color.to_colorref()));
+                    for i in 0..segment_count {
+                        let seg_x = bar_x + i * (seg_w + seg_gap);
+                        let seg_start = (i as f64) * segment_percent;
+                        let seg_end = seg_start + segment_percent;
+
+                        let overlap_start = band_lo.max(seg_start);
+                        let overlap_end = band_hi.min(seg_end);
+                        if overlap_end <= overlap_start {
+                            continue;
+                        }
+
+                        let frac_start = (overlap_start - seg_start) / segment_percent;
+                        let frac_end = (overlap_end - seg_start) / segment_percent;
+                        let fill_left = seg_x + (seg_w as f64 * frac_start) as i32;
+                        let fill_right = seg_x + (seg_w as f64 * frac_end) as i32;
+                        if fill_right <= fill_left {
+                            continue;
+                        }
+
+                        let band_rect = RECT {
+                            left: fill_left,
+                            top: y,
+                            right: fill_right,
+                            bottom: y + seg_h,
+                        };
+                        let rgn = CreateRoundRectRgn(
+                            seg_x,
+                            y,
+                            seg_x + seg_w + 1,
+                            y + seg_h + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let _ = SelectClipRgn(hdc, rgn);
+                        FillRect(hdc, &band_rect, band_brush);
+                        let _ = SelectClipRgn(hdc, HRGN::default());
+                        let _ = DeleteObject(rgn);
+                    }
+                    let _ = DeleteObject(band_brush);
+                }
+            } else {
+                let seg_idx =
+                    ((expected / segment_percent).floor() as i32).clamp(0, segment_count - 1);
+                let frac_in_seg =
+                    (expected - (seg_idx as f64) * segment_percent) / segment_percent;
+                let seg_x = bar_x + seg_idx * (seg_w + seg_gap);
+                let tick_center = seg_x + (seg_w as f64 * frac_in_seg).round() as i32;
+
+                let bar_left = bar_x;
+                let bar_right = bar_x + segment_count * (seg_w + seg_gap) - seg_gap;
+                let tick_w = sc(3).max(2);
+                let tick_left = (tick_center - tick_w / 2).clamp(bar_left, bar_right - tick_w);
+
+                let tick_rect = RECT {
+                    left: tick_left,
+                    top: y,
+                    right: tick_left + tick_w,
+                    bottom: y + seg_h,
+                };
+                let tick_brush = CreateSolidBrush(COLORREF(pace_color.to_colorref()));
+                FillRect(hdc, &tick_rect, tick_brush);
+                let _ = DeleteObject(tick_brush);
             }
         }
 
